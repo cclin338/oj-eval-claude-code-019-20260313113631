@@ -20,23 +20,92 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
      * automatically.
      */
 
-    /*
-     *
-     *
-     *
-     *
-     *
-     *
-     * YOUR CODE HERE
-     *
-     *
-     *
-     *
-     *
-     *
-     */
+    // Stack all keys and values for this round
+    // K_all will be [i+1, d] by stacking K[0..i]
+    // V_all will be [i+1, d] by stacking V[0..i]
+
+    Matrix* K_all = nullptr;
+    Matrix* V_all = nullptr;
+
+    for (size_t j = 0; j <= i; ++j) {
+      gpu_sim.MoveMatrixToSharedMem(keys[j]);
+      gpu_sim.MoveMatrixToSharedMem(values[j]);
+
+      if (j == 0) {
+        K_all = matrix_memory_allocator.Allocate("K_all_" + std::to_string(i));
+        V_all = matrix_memory_allocator.Allocate("V_all_" + std::to_string(i));
+        gpu_sim.Copy(keys[j], K_all, Position::kInSharedMemory);
+        gpu_sim.Copy(values[j], V_all, Position::kInSharedMemory);
+      } else {
+        Matrix* K_temp = matrix_memory_allocator.Allocate("K_temp_" + std::to_string(i) + "_" + std::to_string(j));
+        Matrix* V_temp = matrix_memory_allocator.Allocate("V_temp_" + std::to_string(i) + "_" + std::to_string(j));
+        gpu_sim.Concat(K_all, keys[j], K_temp, 0, Position::kInSharedMemory);
+        gpu_sim.Concat(V_all, values[j], V_temp, 0, Position::kInSharedMemory);
+        K_all = K_temp;
+        V_all = V_temp;
+      }
+
+      gpu_sim.MoveMatrixToGpuHbm(keys[j]);
+      gpu_sim.MoveMatrixToGpuHbm(values[j]);
+    }
+
+    // Now K_all and V_all have shape [i+1, d]
+    // Q (current_query) has shape [i+1, d]
+
+    // Transpose K_all to get K_all^T: [i+1, d] -> [d, i+1]
+    gpu_sim.Transpose(K_all, Position::kInSharedMemory);
+
+    // Move query to SRAM
+    gpu_sim.MoveMatrixToSharedMem(current_query);
+
+    // Compute Q @ K_all^T: [i+1, d] @ [d, i+1] = [i+1, i+1]
+    Matrix* QK = matrix_memory_allocator.Allocate("QK_" + std::to_string(i));
+    gpu_sim.MatMul(current_query, K_all, QK);
+
+    // Apply exp for softmax
+    Matrix* QK_exp = matrix_memory_allocator.Allocate("QK_exp_" + std::to_string(i));
+    gpu_sim.MatExp(QK, QK_exp);
+
+    // Compute row-wise sum for softmax normalization
+    // For each row, we need sum of all elements
+    // Since QK_exp is [i+1, i+1], we need to sum along axis 1
+
+    Matrix* softmax_QK = matrix_memory_allocator.Allocate("softmax_QK_" + std::to_string(i));
+
+    // For row-wise softmax, we need to divide each element by its row sum
+    // But our operations don't directly support row-wise operations
+    // We need to compute sum for each row and then divide
+
+    // Extract each row, compute sum, divide, and rebuild
+    for (size_t row = 0; row <= i; ++row) {
+      Matrix* row_data = matrix_memory_allocator.Allocate("row_" + std::to_string(i) + "_" + std::to_string(row));
+      gpu_sim.GetRow(QK_exp, row, row_data, Position::kInSharedMemory);
+
+      Matrix* row_sum = matrix_memory_allocator.Allocate("row_sum_" + std::to_string(i) + "_" + std::to_string(row));
+      gpu_sim.Sum(row_data, row_sum);
+
+      Matrix* row_normalized = matrix_memory_allocator.Allocate("row_norm_" + std::to_string(i) + "_" + std::to_string(row));
+      gpu_sim.MatDiv(row_data, row_sum, row_normalized);
+
+      if (row == 0) {
+        softmax_QK = row_normalized;
+      } else {
+        Matrix* temp = matrix_memory_allocator.Allocate("softmax_build_" + std::to_string(i) + "_" + std::to_string(row));
+        gpu_sim.Concat(softmax_QK, row_normalized, temp, 0, Position::kInSharedMemory);
+        softmax_QK = temp;
+      }
+    }
+
+    // Now compute softmax_QK @ V_all: [i+1, i+1] @ [i+1, d] = [i+1, d]
+    Matrix* result = matrix_memory_allocator.Allocate("result_" + std::to_string(i));
+    gpu_sim.MatMul(softmax_QK, V_all, result);
+
+    // Move result to HBM
+    gpu_sim.MoveMatrixToGpuHbm(result);
+    gpu_sim.MoveMatrixToGpuHbm(current_query);
+
     gpu_sim.Run(false, &matrix_memory_allocator);
-    //rater.CommitAnswer(YOUR_ANSWER_MATRIX)(Commit after running the simulator.)
+    rater.CommitAnswer(*result);
     /*********************  End of your code *********************/
   
     /*
